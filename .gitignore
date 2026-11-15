@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+
+# Xcode
+build/
+DerivedData/
+*.xcarchive
+*.ipa
+*.dSYM.zip
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+
+# XcodeGen output — generated in CI from project.yml
+EasyAI.xcodeproj/
+
+# Local secrets (never commit these)
+*.p12
+*.mobileprovision
+*.cer
+*.key
+cert.b64
+profile.b64
+
+# tooling scratch
+tools/.tmp/
