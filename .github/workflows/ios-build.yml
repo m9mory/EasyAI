@@ -1,0 +1,157 @@
+name: iOS build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build EasyAI
+    # macos-15 ships Xcode 16 with the iOS 18 SDK.
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    env:
+      SCHEME: EasyAI
+      PROJECT: EasyAI.xcodeproj
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      # --- signing (optional) -------------------------------------------------
+      - name: Import signing certificate
+        id: cert
+        env:
+          CERT_P12_BASE64: ${{ secrets.IOS_CERT_P12 }}
+          CERT_P12_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
+        run: |
+          if [ -z "$CERT_P12_BASE64" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Сертификат не задан — соберу неподписанный .ipa для sideload."
+            exit 0
+          fi
+          echo "present=true" >> "$GITHUB_OUTPUT"
+
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASS="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+
+          echo "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$CERT_P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Install provisioning profile
+        id: profile
+        env:
+          PROFILE_BASE64: ${{ secrets.IOS_PROFILE }}
+        run: |
+          if [ -z "$PROFILE_BASE64" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "present=true" >> "$GITHUB_OUTPUT"
+
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          echo "$PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+          security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          /usr/libexec/PlistBuddy -c "Print :Name" "$RUNNER_TEMP/profile.plist" > "$RUNNER_TEMP/profile-name.txt"
+          cp "$RUNNER_TEMP/profile.mobileprovision" \
+             "$HOME/Library/MobileDevice/Provisioning Profiles/$(cat "$RUNNER_TEMP/profile-name.txt").mobileprovision"
+          echo "Профиль: $(cat "$RUNNER_TEMP/profile-name.txt")"
+
+      # --- build --------------------------------------------------------------
+      - name: Build unsigned archive
+        if: steps.cert.outputs.present != 'true' || steps.profile.outputs.present != 'true'
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/EasyAI.xcarchive" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            | tee build.log
+
+      - name: Build signed archive
+        if: steps.cert.outputs.present == 'true' && steps.profile.outputs.present == 'true'
+        env:
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+        run: |
+          set -o pipefail
+          PROFILE=$(cat "$RUNNER_TEMP/profile-name.txt")
+          xcodebuild archive \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/EasyAI.xcarchive" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE" \
+            | tee build.log
+
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/EasyAI.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist .github/ExportOptions.plist
+
+      - name: Package unsigned IPA
+        if: steps.cert.outputs.present != 'true' || steps.profile.outputs.present != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/export/Payload"
+          cp -R "$RUNNER_TEMP/EasyAI.xcarchive/Products/Applications/EasyAI.app" "$RUNNER_TEMP/export/Payload/"
+          cd "$RUNNER_TEMP/export"
+          zip -qry EasyAI-unsigned.ipa Payload
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          find "$RUNNER_TEMP/export" -maxdepth 1 -name "*.ipa" -exec cp {} artifacts/ \; || true
+          ls -la artifacts
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: EasyAI-ipa
+          path: artifacts/*.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: EasyAI-build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 5
